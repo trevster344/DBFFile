@@ -73,21 +73,20 @@ describe('Writing a DBF file', () => {
         {
             description: `DBF with memo file (version 0x83)`,
             filename: 'dbase_83.dbf',
-            recordCount: 0,
+            options: {fileVersion: 0x83},
+            recordCount: 67,
             newFields: [],
             newRecord: record => record,
-            firstRecord: {},
-            error: 'Writing to files with memo fields is not supported.',
+            firstRecord: {ID: 87, CODE: '1', NAME: 'Assorted Petits Fours', WEIGHT: 5.51},
         },
         {
             description: `DBF with memo file (version 0x8b)`,
             filename: 'dbase_8b.dbf',
             options: {fileVersion: 0x8b},
-            recordCount: 0,
+            recordCount: 10,
             newFields: [],
             newRecord: record => record,
-            firstRecord: {},
-            error: 'Writing to files with memo fields is not supported.',
+            firstRecord: {CHARACTER: 'One', NUMERICAL: 1, LOGICAL: true, FLOAT: 1.23456789012346},
         },
         {
             description: `VFP DBF with an 'T' (DateTime) field`,
@@ -108,11 +107,10 @@ describe('Writing a DBF file', () => {
             description: `VFP DBF with memo file (version 0x30)`,
             filename: 'vfp9_30_memo.dbf',
             options: {fileVersion: 0x30},
-            recordCount: 0,
+            recordCount: 2,
             newFields: [],
             newRecord: record => record,
-            firstRecord: {},
-            error: 'Writing to files with memo fields is not supported.',
+            firstRecord: {ID: 1, CHAR: 'Text1', NUM: 999.50},
         },
         {
             description: `DBF with unsupported version`,
@@ -207,6 +205,8 @@ describe('Writing a DBF file', () => {
     ];
 
     rimraf.sync(path.join(__dirname, `./fixtures/*.out`));
+    rimraf.sync(path.join(__dirname, `./fixtures/*.dbf.dbt`));
+    rimraf.sync(path.join(__dirname, `./fixtures/*.dbf.fpt`));
 
     tests.forEach(test => {
         it(test.description, async () => {
@@ -232,6 +232,10 @@ describe('Writing a DBF file', () => {
             }
             finally {
                 await fs.unlink(dstPath).catch(() => {});
+                for (const ext of ['.dbt', '.DBT', '.fpt', '.FPT']) {
+                    await fs.unlink(dstPath.slice(0, -4) + ext).catch(() => {});
+                    await fs.unlink(dstPath + ext).catch(() => {});
+                }
             }
             expect(dstDbf.recordCount, 'the record count should match').equals(expectedRecordCount);
             expect(records[0], 'first record should match').to.deep.include(expectedFirstRecord!);
