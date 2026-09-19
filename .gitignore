@@ -4,3 +4,6 @@ node_modules/
 *.log
 *.sln
 .DS_Store
+
+# Local scratch folder for ad-hoc DBF/DBT/FPT/CDX files under test.
+local/
