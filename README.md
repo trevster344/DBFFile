@@ -14,9 +14,9 @@ Read and write .dbf (dBase III, dBase IV, FoxPro and Visual FoxPro) files in Nod
   - `D` (date)
   - `T` (datetime)
   - `B` (double)
-  - `M` (memo) Note: memo support is experimental/partial, with the following limitations:
-    - read-only (can't create/write DBF files with memo fields)
-    - supports dBase III (version 0x83), dBase IV (version 0x8b), VFP9 (version 0x30) and FoxPro 2 (version 0xf5) memo files
+  - `M` (memo) — read **and write**, supporting dBase III (version 0x83), dBase IV (version 0x8b), VFP9 (version 0x30)
+    and FoxPro 2 (version 0xf5) memo files. Memo writes reuse an existing block chain when the new value fits, otherwise
+    they append a new chain (matching the classic xBase products).
 - 'Loose' read mode - tries to read any kind of .dbf file without complaining. Unsupported field types are simply skipped.
 - Supports Clipper long character fields (`C` fields longer than 255 bytes), with the following limitations:
   - read-only (can't create/write DBF files with long character fields)
@@ -33,6 +33,14 @@ Read and write .dbf (dBase III, dBase IV, FoxPro and Visual FoxPro) files in Nod
   - Can use field descriptors from a user-specified object of from another instance
 - Can append records to an existing .dbf file
   - Supports very large files
+- Can update records in place
+  - `updateRecord(index, record)` and `updateRecords([{index, record}, ...])` write only the affected record bytes
+    (and any new memo data); the file is not rewritten
+- Optional multi-user locking, compatible with dBase/FoxPro/Clipper
+  - native byte-range locks (Windows `LockFileEx`, POSIX `fcntl`) using the historical xBase "read-through" lock offsets
+  - file locks and record locks, probed freshly from the OS on every operation (never cached)
+  - opt-in via `{locking: true}`, at which point writes require an explicit lock and lock-aware reads are refused while a
+    blocking file lock is held; see [LOCKING.md](./LOCKING.md)
 - Can specify character encodings either per-file or per-field.
   - the default encoding is `'ISO-8859-1'` (also known as latin 1)
   - example per-file encoding: `DBFFile.open(<path>, {encoding: 'EUC-JP'})`
@@ -94,6 +102,81 @@ async function batchWrite() {
 }
 ```
 
+### Example: writing a .dbf file with memo fields
+
+```javascript
+import {DBFFile} from 'dbffile';
+
+async function memoWrite() {
+    let fieldDescriptors = [
+        { name: 'id', type: 'N', size: 10 },
+        { name: 'notes', type: 'M', size: 4 } // memo field: size 4 for VFP9 (0x30), 10 otherwise
+    ];
+
+    // Memo fields require a memo-capable file version: 0x83, 0x8b, 0x30 or 0xf5.
+    let dbf = await DBFFile.create('<full path to .dbf file>', fieldDescriptors, {fileVersion: 0x30});
+    await dbf.appendRecords([
+        { id: 1, notes: 'a memo value' },
+        { id: 2, notes: 'a much longer memo value that spans multiple blocks...' }
+    ]);
+}
+```
+
+### Example: updating records in place
+
+```javascript
+import {DBFFile} from 'dbffile';
+
+async function updateInPlace() {
+    let dbf = await DBFFile.open('<full path to .dbf file>');
+
+    // Update one record by index. Only that record's bytes are written.
+    await dbf.updateRecord(3, { id: 4, notes: 'replacement value' });
+
+    // Update several records in one call.
+    await dbf.updateRecords([
+        { index: 5, record: { id: 6, notes: 'first' } },
+        { index: 9, record: { id: 10, notes: 'second' } }
+    ]);
+}
+```
+
+### Example: multi-user locking (dBase/FoxPro/Clipper compatible)
+
+```javascript
+import {DBFFile} from 'dbffile';
+
+async function lockedUpdate() {
+    // Locking is opt-in. With {locking: true}, writes require an explicit lock and lock-aware
+    // reads are refused while another process holds a blocking file lock.
+    let dbf = await DBFFile.open('<full path to .dbf file>', {locking: true});
+
+    // Lock a single record, read-modify-write, then release.
+    await dbf.lockRecord(3);
+    try {
+        let record = (await dbf.readRecords(4))[3];
+        await dbf.updateRecord(3, {...record, notes: 'updated safely'});
+    }
+    finally {
+        await dbf.unlockRecord(3);
+    }
+
+    // Whole-file operations (e.g. appends) take the file lock instead.
+    await dbf.lockFile();
+    try {
+        await dbf.appendRecords([{id: 99, notes: 'appended'}]);
+    }
+    finally {
+        await dbf.unlockFile();
+    }
+
+    // Lock state can be probed freshly at any time.
+    console.log('record 3 locked?', await dbf.isRecordLocked(3));
+
+    await dbf.close(); // releases any native lock handles
+}
+```
+
 ### Loose Read Mode
 
 Not all versions and variants of .dbf file are supported by this library. Normally, when an unsupported file version or
@@ -139,6 +222,31 @@ class DBFFile {
     /** Appends the specified records to this DBF file. */
     appendRecords(records: object[]): Promise<DBFFile>;
 
+    /** Updates a single record in place, at the given zero-based index. */
+    updateRecord(index: number, record: object): Promise<DBFFile>;
+
+    /** Updates multiple records in place. */
+    updateRecords(updates: {index: number, record: object}[]): Promise<DBFFile>;
+
+    /** Places an exclusive lock on the file's header region. */
+    lockFile(options?: LockOptions): Promise<void>;
+    unlockFile(): Promise<void>;
+
+    /** Places/releases an exclusive lock on a single record's byte range. */
+    lockRecord(index: number, options?: LockOptions): Promise<void>;
+    unlockRecord(index: number): Promise<void>;
+
+    /** Places/releases an exclusive lock on the memo file's header region. */
+    lockMemoFile(options?: LockOptions): Promise<void>;
+    unlockMemoFile(): Promise<void>;
+
+    /** Freshly probes the OS lock table for a file/record lock. */
+    isFileLocked(): Promise<boolean>;
+    isRecordLocked(index: number): Promise<boolean>;
+
+    /** Releases any native lock handles held by this instance. */
+    close(): Promise<void>;
+
     /** Iterates over each record in this DBF file. */
     [Symbol.asyncIterator](): AsyncGenerator<object>;
 }
@@ -183,16 +291,48 @@ interface OpenOptions {
      * Deleted records have the property `[DELETED]: true`, using the `DELETED` symbol exported from this library.
      */
     includeDeletedRecords?: boolean;
+
+    /**
+     * Enables lock-aware behaviour. When true, lock-aware reads are refused while another process holds a
+     * blocking (file) lock, and writes are refused unless this instance holds the appropriate record/file lock.
+     * Lock state is always probed freshly from the OS; it is never cached. Defaults to false.
+     */
+    locking?: boolean;
+
+    /**
+     * Overrides the synthetic xBase lock offset used to place write locks beyond the real data. Defaults to
+     * 4,000,000,000 for FoxPro/VFP files and 1,000,000,000 for dBASE/Clipper files.
+     */
+    lockOffset?: number;
 }
 
 /** Options that may be passed to `DBFFile.create`. */
 interface CreateOptions {
 
-    /** The file version to create. Currently versions 0x03, 0x83, 0x8b and 0x30 are supported. Defaults to 0x03. */
+    /** The file version to create. Currently versions 0x03, 0x83, 0x8b, 0x30 and 0xf5 are supported. Defaults to 0x03. */
     fileVersion?: FileVersion;
 
     /** The character encoding(s) to use when writing the DBF file. Defaults to ISO-8859-1. */
     encoding?: Encoding;
+
+    /** The block size to use for a newly created memo file. Defaults to 512. */
+    memoBlockSize?: number;
+
+    /** Enables lock-aware behaviour on the created instance. See `OpenOptions.locking`. Defaults to false. */
+    locking?: boolean;
+
+    /** Overrides the synthetic xBase lock offset. See `OpenOptions.lockOffset`. */
+    lockOffset?: number;
+}
+
+/** Options accepted by the locking methods. */
+interface LockOptions {
+
+    /** When true, wait for the lock to become available instead of failing immediately. Defaults to false. */
+    wait?: boolean;
+
+    /** Maximum time to wait for a lock, in milliseconds. Defaults to 10000. */
+    timeoutMs?: number;
 }
 
 /**
@@ -202,3 +342,8 @@ interface CreateOptions {
  */
 type Encoding = string | {default: string, [fieldName: string]: string};
 ```
+
+### Testing
+
+`npm test` runs the suite natively. `npm run test:wsl` optionally runs the full suite inside WSL
+(opt-in) to exercise the POSIX `fcntl` locking path. See [TESTING.md](./TESTING.md) for details.

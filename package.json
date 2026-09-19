@@ -10,6 +10,7 @@
     "clean": "rimraf dist/",
     "prepublish": "npm run self-ref && npm run build",
     "test": "mocha --timeout 999999 --colors ./dist/test",
+    "test:wsl": "node scripts/wsl-test.js",
     "test:watch": "npm run build:watch & npx mocha ./dist/test/ --watch",
     "self-ref": "node ./scripts/enable-self-reference"
   },
@@ -46,6 +47,7 @@
     "typescript": "^4.3.5"
   },
   "dependencies": {
-    "iconv-lite": "^0.4.24"
+    "iconv-lite": "^0.4.24",
+    "koffi": "^3.3.1"
   }
 }

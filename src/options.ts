@@ -23,6 +23,22 @@ export interface OpenOptions {
 
     /** Indicates whether deleted records should be included in results when reading records. Defaults to false. */
     includeDeletedRecords?: boolean;
+
+    /**
+     * Enables lock-aware behaviour. When true, reads are refused while another process holds a
+     * blocking (file) lock, and writes are refused unless this instance holds the appropriate
+     * record/file lock and no foreign lock conflicts. When false (the default), the lock methods
+     * are still available but no automatic checks are performed. Lock state is always probed
+     * freshly from the OS; it is never cached.
+     */
+    locking?: boolean;
+
+    /**
+     * Overrides the synthetic xBase lock offset used to place write locks beyond the real data
+     * (so that reads remain unblocked). Defaults to 4,000,000,000 for FoxPro/VFP files and
+     * 1,000,000,000 for dBASE/Clipper files.
+     */
+    lockOffset?: number;
 }
 
 
@@ -31,11 +47,47 @@ export interface OpenOptions {
 /** Options for creating a DBF file. */
 export interface CreateOptions {
 
-    /** The file version to create. Currently versions 0x03, 0x83, 0x8b and 0x30 are supported. Defaults to 0x03. */
+    /** The file version to create. Currently versions 0x03, 0x83, 0x8b, 0x30 and 0xf5 are supported. Defaults to 0x03. */
     fileVersion?: FileVersion;
 
     /** The character encoding(s) to use when writing the DBF file. Defaults to ISO-8859-1. */
     encoding?: Encoding;
+
+    /** The block size to use for a newly created memo file. Defaults to 512. */
+    memoBlockSize?: number;
+
+    /** Enables lock-aware behaviour on the created instance. See `OpenOptions.locking`. Defaults to false. */
+    locking?: boolean;
+
+    /**
+     * Overrides the synthetic xBase lock offset used to place write locks beyond the real data.
+     * Defaults to 4,000,000,000 for FoxPro/VFP files and 1,000,000,000 for dBASE/Clipper files.
+     */
+    lockOffset?: number;
+}
+
+
+
+
+/** OpenOptions with defaults applied. */
+export interface NormalisedOpenOptions {
+    encoding: Encoding;
+    readMode: 'strict' | 'loose';
+    includeDeletedRecords: boolean;
+    locking: boolean;
+    lockOffset?: number;
+}
+
+
+
+
+/** CreateOptions with defaults applied. */
+export interface NormalisedCreateOptions {
+    fileVersion: FileVersion;
+    encoding: Encoding;
+    memoBlockSize: number;
+    locking: boolean;
+    lockOffset?: number;
 }
 
 
@@ -52,7 +104,7 @@ export type Encoding = string | {default: string, [fieldName: string]: string};
 
 
 /** Validates the given OpenOptions and substitutes defaults for missing properties. Returns a new options object. */
-export function normaliseOpenOptions(options: OpenOptions | undefined): Required<OpenOptions> {
+export function normaliseOpenOptions(options: OpenOptions | undefined): NormalisedOpenOptions {
 
     // Validate `encoding`.
     let encoding = options?.encoding ?? 'ISO-8859-1';
@@ -70,15 +122,27 @@ export function normaliseOpenOptions(options: OpenOptions | undefined): Required
         throw new Error(`Invalid value 'includeDeletedRecords' value ${includeDeletedRecords}`);
     }
 
+    // Validate `locking`.
+    let locking = options?.locking ?? false;
+    if (typeof locking !== 'boolean') {
+        throw new Error(`Invalid 'locking' value ${locking}`);
+    }
+
+    // Validate `lockOffset`.
+    let lockOffset = options?.lockOffset;
+    if (lockOffset !== undefined && (typeof lockOffset !== 'number' || !Number.isInteger(lockOffset) || lockOffset < 0)) {
+        throw new Error(`Invalid 'lockOffset' value ${lockOffset}`);
+    }
+
     // Return a new normalised options object.
-    return {encoding, readMode, includeDeletedRecords};
+    return {encoding, readMode, includeDeletedRecords, locking, lockOffset};
 }
 
 
 
 
 /** Validates the given CreateOptions and substitutes defaults for missing properties. Returns a new options object. */
-export function normaliseCreateOptions(options: CreateOptions | undefined): Required<CreateOptions> {
+export function normaliseCreateOptions(options: CreateOptions | undefined): NormalisedCreateOptions {
 
     // Validate `fileVersion`.
     let fileVersion = options?.fileVersion ?? 0x03;
@@ -88,8 +152,26 @@ export function normaliseCreateOptions(options: CreateOptions | undefined): Requ
     let encoding = options?.encoding ?? 'ISO-8859-1';
     assertValidEncoding(encoding);
 
+    // Validate `memoBlockSize`.
+    let memoBlockSize = options?.memoBlockSize ?? 512;
+    if (typeof memoBlockSize !== 'number' || !Number.isInteger(memoBlockSize) || memoBlockSize < 512) {
+        throw new Error(`Invalid 'memoBlockSize' value ${memoBlockSize} (minimum is 512)`);
+    }
+
+    // Validate `locking`.
+    let locking = options?.locking ?? false;
+    if (typeof locking !== 'boolean') {
+        throw new Error(`Invalid 'locking' value ${locking}`);
+    }
+
+    // Validate `lockOffset`.
+    let lockOffset = options?.lockOffset;
+    if (lockOffset !== undefined && (typeof lockOffset !== 'number' || !Number.isInteger(lockOffset) || lockOffset < 0)) {
+        throw new Error(`Invalid 'lockOffset' value ${lockOffset}`);
+    }
+
     // Return a new normalised options object.
-    return {fileVersion, encoding};
+    return {fileVersion, encoding, memoBlockSize, locking, lockOffset};
 }
 
 
