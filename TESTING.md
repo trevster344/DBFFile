@@ -98,3 +98,25 @@ docker run --rm -v "D:\path\to\DBFFile:/work" -w /work node:22-bookworm \
 
 The locking tests spawn separate worker processes (`test/lock-worker.ts`) because POSIX locks are
 per-process and Windows locks are per-handle.
+
+## Large-scale concurrency stress
+
+`test/cdx-stress.ts` seeds a large indexed table and then runs several worker processes that, at the
+same time, append batches, delete records and edit records in the middle of the file. It asserts that
+the final `.cdx` is a complete, correct reflection of the final DBF (coverage, key ordering, and every
+stored key equal to the expression evaluated on the record), independent of interleaving.
+
+Scale is configurable (defaults in parentheses):
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `CDX_STRESS_N` | `100000` | Seed records |
+| `CDX_STRESS_WORKERS` | `4` | Concurrent client processes |
+| `CDX_STRESS_APPENDS` | `5000` | Records each worker appends |
+
+For hundreds of thousands of records:
+
+```
+CDX_STRESS_N=300000 CDX_STRESS_APPENDS=20000 npm test -- --grep "large-scale"
+```
+

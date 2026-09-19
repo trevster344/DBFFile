@@ -183,9 +183,9 @@ describe('Reading a DBF file', () => {
             deletedCount: 1,
         },
         {
-            description: `DBF with unsupported file version and field types in 'strict' (default) read mode`,
+            description: `VFP 0x31 DBF with an unsupported system field type in 'strict' (default) read mode`,
             filename: 'dbase_31.dbf',
-            error: 'unknown/unsupported dBase version: 49',
+            error: `Type '0' is not supported`,
         },
         {
             description: `DBF with unsupported file version and field types in 'loose' read mode`,

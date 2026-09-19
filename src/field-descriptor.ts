@@ -1,3 +1,8 @@
+import {isVfp9FileVersion} from './file-version';
+
+
+
+
 /** Metadata describing a single field in a DBF file. */
 export interface FieldDescriptor {
 
@@ -37,7 +42,7 @@ export function validateFieldDescriptor(
     if (FieldTypes.indexOf(type) === -1) throw new Error(`Type '${type}' is not supported`);
 
     // size
-    const memoSize = fileVersion == 0x30 ? 4 : 10;
+    const memoSize = isVfp9FileVersion(fileVersion) ? 4 : 10;
     if (typeof size !== 'number') throw new Error('Size must be a number');
     if (size < 1) throw new Error('Field size is too small (minimum is 1)');
     if (type === 'C' && size > maximumCharacterFieldSize) {

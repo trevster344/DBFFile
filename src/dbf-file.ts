@@ -1,13 +1,20 @@
 import * as assert from 'assert';
 import * as iconv from 'iconv-lite';
+import {promises as fs} from 'fs';
 import {extname} from 'path';
 import {FieldDescriptor, validateFieldDescriptor} from './field-descriptor';
-import {isValidFileVersion} from './file-version';
-import {CreateOptions, Encoding, normaliseCreateOptions, normaliseOpenOptions, OpenOptions} from './options';
+import {isValidFileVersion, isVfp9FileVersion} from './file-version';
+import {CreateOptions, Encoding, IndexDefinition, normaliseCreateOptions, normaliseOpenOptions, OpenOptions} from './options';
 import {close, open, read, stat, write} from './utils';
 import {createDate, format8CharDate, formatVfpDateTime, parseVfpDateTime, parse8CharDate} from './utils';
 import {FileLocker, LockError, LockOptions, LockRange} from './file-lock';
 import {MemoFile} from './memo-file';
+import {CDX_TYPE_COMPOUND, CdxKeyType, CdxOption, CdxTagInfo, ExpressionCompat} from './cdx/cdx-format';
+import {CdxIndex} from './cdx/cdx-index';
+import {encodeCdxKey, compareCdxKeys, keyPadByte} from './cdx/cdx-key';
+import {CdxCollation, collationForName} from './cdx/cdx-collation';
+import {CdxBuildTag, buildCdx} from './cdx/cdx-writer';
+import {CdxEvalContext, CdxExpression, CdxValue} from './cdx/cdx-expression';
 
 
 
@@ -37,18 +44,42 @@ export class DBFFile {
     /** Metadata for all fields defined in the DBF file. */
     fields = [] as FieldDescriptor[];
 
+    /** Open CDX compound index, when CDX usage was opted into (empty otherwise). */
+    indexes = [] as CdxIndex[];
+
+    /** Tag metadata for the open CDX index (empty when no index is open). */
+    tags = [] as CdxTagInfo[];
+
     /**
      * Reads a subset of records from this DBF file. If the `includeDeletedRecords` option is set, then deleted records
      * are included in the results, otherwise they are skipped. Deleted records have the property `[DELETED]: true`,
      * using the `DELETED` symbol exported from this library.
      */
-    readRecords(maxCount = 10000000) {
-        return readRecordsFromDBF(this, maxCount);
+    readRecords(maxCountOrOptions: number | ReadRecordsOptions = 10000000) {
+        if (typeof maxCountOrOptions === 'object' && maxCountOrOptions !== null) {
+            return readRecordsFromIndex(this, maxCountOrOptions);
+        }
+        return readRecordsFromDBF(this, maxCountOrOptions);
+    }
+
+    /** Seeks the first record matching `value` in the named CDX tag, or undefined if none matches. */
+    seek(tagName: string, value: unknown): Promise<Record<string, unknown> | undefined> {
+        return seekInIndex(this, tagName, value);
     }
 
     /** Appends the specified records to this DBF file. */
     appendRecords(records: any[]) {
         return appendRecordsToDBF(this, records);
+    }
+
+    /** Marks a record as deleted (sets the `0x2A` flag). */
+    deleteRecord(index: number): Promise<DBFFile> {
+        return setRecordDeleted(this, index, true);
+    }
+
+    /** Clears the deleted flag on a record. */
+    undeleteRecord(index: number): Promise<DBFFile> {
+        return setRecordDeleted(this, index, false);
     }
 
     /**
@@ -114,10 +145,54 @@ export class DBFFile {
         return this._getMemoLocker().unlock(memoLockRange(this));
     }
 
-    /** Releases any native lock handles held by this instance. */
+    /** Places an exclusive lock on the CDX index file's header region. */
+    lockIndexFile(options?: LockOptions): Promise<void> {
+        return this._getCdxLocker().lock(indexLockRange(this), 'write', options);
+    }
+
+    /** Releases the CDX index file lock placed by `lockIndexFile`. */
+    unlockIndexFile(): Promise<void> {
+        return this._getCdxLocker().unlock(indexLockRange(this));
+    }
+
+    /** Releases any native lock handles held by this instance, rebuilding a stale index first. */
     async close(): Promise<void> {
+        if (this._indexDirty && (this._indexDefinitions || this._cdx)) {
+            await this.reindex();
+        }
         if (this._locker) await this._locker.close();
         if (this._memoLocker) await this._memoLocker.close();
+        if (this._cdxLocker) await this._cdxLocker.close();
+        this.closeIndex();
+    }
+
+    /** Opens (or re-opens) a CDX compound index and loads its tag metadata. */
+    async openIndex(path?: string): Promise<CdxIndex> {
+        const cdxPath = path ?? this._cdx?.path ?? cdxPathFor(this.path);
+        const cdx = await withIndexReadLock(this, cdxPath, () => CdxIndex.open(cdxPath));
+        this._cdx = cdx;
+        this.indexes = [cdx];
+        this.tags = cdx.tags;
+        return cdx;
+    }
+
+    /** Closes the currently-open CDX index, if any. */
+    closeIndex(): void {
+        this._cdx = undefined;
+        this.indexes = [];
+        this.tags = [];
+    }
+
+    /**
+     * Rebuilds the production CDX index (or a single tag) from the current DBF records. This is the
+     * repair/reindex path used after writes and to recover stale indexes.
+     *
+     * By default this refuses to overwrite a tag whose rebuilt keys do not match any existing key
+     * (which indicates the index was built with different expression semantics, e.g. by Sequiter
+     * CodeBase). Pass `{force: true}` to reindex anyway.
+     */
+    reindex(tagName?: string, options?: {force?: boolean}): Promise<void> {
+        return reindexDBF(this, tagName, options?.force ?? false);
     }
 
     // Internal: lazily-created lockers (one per file) that keep native handles alive while locks are held.
@@ -130,6 +205,12 @@ export class DBFFile {
         if (!this._memoPath) throw new LockError('This DBF file has no memo file to lock', 'ENOMEMO');
         if (!this._memoLocker) this._memoLocker = new FileLocker(this._memoPath);
         return this._memoLocker;
+    }
+
+    _getCdxLocker(cdxPath?: string): FileLocker {
+        const resolved = cdxPath ?? this._cdx?.path ?? cdxPathFor(this.path);
+        if (!this._cdxLocker) this._cdxLocker = new FileLocker(resolved);
+        return this._cdxLocker;
     }
 
     /**
@@ -147,8 +228,10 @@ export class DBFFile {
     _readMode = 'strict' as 'strict' | 'loose';
     _encoding = '' as Encoding;
     _includeDeletedRecords = false;
+    _rawCharacterFields = false;
     _locking = false;
     _lockOffset?: number;
+    _expressionCompat: ExpressionCompat = 'standard';
     _memoBlockSize = 512;
     _recordsRead = 0;
     _headerLength = 0;
@@ -157,6 +240,11 @@ export class DBFFile {
     _version? = 0;
     _locker?: FileLocker;
     _memoLocker?: FileLocker;
+    _cdxLocker?: FileLocker;
+    _cdx?: CdxIndex;
+    _indexDefinitions?: IndexDefinition[];
+    _indexDirty = false;
+    _indexMarker?: string;
 }
 
 
@@ -164,6 +252,19 @@ export class DBFFile {
 
 /** Symbol used for detecting deleted records when the `includeDeletedRecords` option is used. */
 export const DELETED = Symbol();
+
+
+
+
+/** Options for reading records in CDX index order. */
+export interface ReadRecordsOptions {
+
+    /** The tag name to read records in the order of. */
+    index: string;
+
+    /** Maximum number of records to return. Defaults to 10000000. */
+    maxCount?: number;
+}
 
 
 
@@ -196,7 +297,7 @@ async function openDBF(path: string, opts?: OpenOptions): Promise<DBFFile> {
 
         // Locate the memo file, if any. dBASE versions require one; FoxPro/VFP versions may or may not
         // have one. Allow missing memo files if reading in 'loose' mode.
-        if (fileVersion === 0x83 || fileVersion === 0x8b || fileVersion === 0x30 || fileVersion === 0xf5) {
+        if (fileVersion === 0x83 || fileVersion === 0x8b || isVfp9FileVersion(fileVersion) || fileVersion === 0xf5) {
             const base = memoPathFor(path, fileVersion);
             const baseExt = extname(base);
             for (const candidate of [base, base.slice(0, -baseExt.length) + baseExt.toUpperCase()]) {
@@ -274,11 +375,16 @@ async function openDBF(path: string, opts?: OpenOptions): Promise<DBFFile> {
         result._includeDeletedRecords = options.includeDeletedRecords;
         result._locking = options.locking;
         result._lockOffset = options.lockOffset;
+        result._expressionCompat = options.expressionCompat;
         result._recordsRead = 0;
         result._headerLength = headerLength;
         result._recordLength = recordLength;
         result._memoPath = memoPath;
         result._version = fileVersion;
+
+        // Opt-in CDX support: open and verify the production index.
+        if (options.cdx) await openCdxForResult(result, path, fileVersion, options.cdx);
+
         return result;
     }
     finally {
@@ -300,11 +406,23 @@ async function createDBF(path: string, fields: FieldDescriptor[], opts?: CreateO
 
         // Memo fields are only meaningful with a memo-capable file version.
         let hasMemoFields = fields.some(f => f.type === 'M');
-        if (hasMemoFields && fileVersion !== 0x83 && fileVersion !== 0x8b && fileVersion !== 0x30 && fileVersion !== 0xf5) {
-            throw new Error(`Memo fields require file version 0x83, 0x8b, 0x30 or 0xf5.`);
+        if (hasMemoFields && fileVersion !== 0x83 && fileVersion !== 0x8b && !isVfp9FileVersion(fileVersion) && fileVersion !== 0xf5) {
+            throw new Error(`Memo fields require file version 0x83, 0x8b, 0x30, 0x31 or 0xf5.`);
         }
         if (hasMemoFields && fileVersion === 0x83 && options.memoBlockSize !== 512) {
             throw new Error(`Version 0x83 memo files use a fixed 512-byte block size.`);
+        }
+
+        // CDX indexes require a FoxPro/VFP-compatible version (or an explicit cdx option).
+        let hasIndexes = !!(options.indexes && options.indexes.length);
+        if (hasIndexes) {
+            const cdxVersion = options.cdx ?? (isVfp9FileVersion(fileVersion) ? 0x30 : fileVersion === 0xf5 ? 0xf5 : undefined);
+            if (cdxVersion === undefined) throw new Error(`Creating CDX indexes requires a VFP/FoxPro file version or an explicit 'cdx' option.`);
+        }
+        const indexedFields = new Set<string>();
+        if (options.indexes) for (const def of options.indexes) {
+            const expression = CdxExpression.parse(def.expression);
+            if (expression.referencedFields.length === 1) indexedFields.add(expression.referencedFields[0].toLowerCase());
         }
 
         // Create the file and create a buffer to write through.
@@ -326,7 +444,8 @@ async function createDBF(path: string, fields: FieldDescriptor[], opts?: CreateO
         buffer.writeUInt32LE(0, 0x10);                              // Reserved/unused (set to zero)
         buffer.writeUInt32LE(0, 0x14);                              // Reserved/unused (set to zero)
         buffer.writeUInt32LE(0, 0x18);                              // Reserved/unused (set to zero)
-        let tableFlags = (fileVersion === 0x30 || fileVersion === 0xf5) && hasMemoFields ? 0x02 : 0;
+        let tableFlags = (isVfp9FileVersion(fileVersion) || fileVersion === 0xf5) && hasMemoFields ? 0x02 : 0;
+        if (hasIndexes) tableFlags |= 0x01; // structural (production) CDX present
         buffer.writeUInt32LE(tableFlags, 0x1C);                     // VFP table flags (0x02 = has memo field)
         await write(fd, buffer, 0, 32, 0);
 
@@ -346,7 +465,7 @@ async function createDBF(path: string, fields: FieldDescriptor[], opts?: CreateO
             buffer.writeUInt8(0, 0x17);                             // Flag for SET fields (set to zero)
             buffer.writeUInt32LE(0, 0x18);                          // Reserved (set to zero)
             buffer.writeUInt32LE(0, 0x1C);                          // Reserved (set to zero)
-            buffer.writeUInt8(0, 0x1F);                             // Index field flag (set to zero)
+            buffer.writeUInt8(indexedFields.has(name.toLowerCase()) ? 1 : 0, 0x1F); // Index field flag
             await write(fd, buffer, 0, 32, 32 + i * 32);
         }
 
@@ -364,6 +483,14 @@ async function createDBF(path: string, fields: FieldDescriptor[], opts?: CreateO
             await memo.close();
         }
 
+        // Create the production CDX index, if indexes were requested.
+        let cdxPath: string | undefined;
+        if (hasIndexes) {
+            cdxPath = cdxPathFor(path);
+            const cdxBuffer = buildCdx(options.indexes!.map(def => emptyBuildTag(def, fields)));
+            await writeIndexFile(cdxPath, cdxBuffer);
+        }
+
         // Return a new DBFFile instance.
         let result = new DBFFile();
         result.path = path;
@@ -374,12 +501,15 @@ async function createDBF(path: string, fields: FieldDescriptor[], opts?: CreateO
         result._encoding = options.encoding;
         result._locking = options.locking;
         result._lockOffset = options.lockOffset;
+        result._expressionCompat = options.expressionCompat;
         result._memoBlockSize = options.memoBlockSize;
         result._recordsRead = 0;
         result._headerLength = headerLength;
         result._recordLength = recordLength;
         result._memoPath = memoPath;
         result._version = fileVersion;
+        result._indexDefinitions = options.indexes;
+        if (cdxPath) await result.openIndex(cdxPath);
         return result;
     }
     finally {
@@ -395,14 +525,26 @@ async function createDBF(path: string, fields: FieldDescriptor[], opts?: CreateO
 async function readRecordsFromDBF(dbf: DBFFile, maxCount: number) {
     let fd = 0;
     let memoFd = 0;
+    let readLock: {locker: FileLocker, range: LockRange} | undefined;
     try {
-        // Lock-aware reads: refuse to read while another process holds a blocking (file) lock. Record
-        // locks do not block reads (the historical xBase "read-through" behaviour).
+        // Lock-aware reads: take a shared file lock for the duration of the read. This succeeds while
+        // other readers (or a reindex, which also holds it shared) are active, but fails if a writer
+        // holds the exclusive lock — so reads are refused only when a lock would actually block them.
+        // Record locks do not block reads (the historical xBase "read-through" behaviour).
         if (dbf._locking) {
             const locker = dbf._getLocker();
             const range = fileLockRange(dbf);
-            if (!locker.holdsRange(range) && (await locker.probe(range)).locked) {
-                throw new LockError(`Cannot read '${dbf.path}': it is locked by another process`, 'EBUSY');
+            if (!locker.holdsRange(range)) {
+                try {
+                    await locker.lock(range, 'read');
+                }
+                catch (err) {
+                    if (err instanceof LockError && err.code === 'EBUSY') {
+                        throw new LockError(`Cannot read '${dbf.path}': it is locked for writing by another process`, 'EBUSY');
+                    }
+                    throw err;
+                }
+                readLock = {locker, range};
             }
         }
 
@@ -429,7 +571,7 @@ async function readRecordsFromDBF(dbf: DBFFile, maxCount: number) {
         let memoBuf: Buffer | undefined;
         if (dbf._memoPath) {
             memoFd = await open(dbf._memoPath, 'r');
-            if (dbf._version === 0x30 || dbf._version === 0xf5) {
+            if (isVfp9FileVersion(dbf._version!) || dbf._version === 0xf5) {
                 // VFP9 or FoxPro 2
                 await read(memoFd, buffer, 0, 2, 6);
                 memoBlockSize = buffer.readUInt16BE(0) || 512;
@@ -487,7 +629,11 @@ async function readRecordsFromDBF(dbf: DBFFile, maxCount: number) {
                     // Decode the field from the buffer, according to its type.
                     switch (field.type) {
                         case 'C': // Text
-                            while (len > 0 && buffer[offset + len - 1] === 0x20) --len;
+                            // Key building needs the untrimmed, fixed-width field value (FoxPro
+                            // concatenates padded fields), so trimming is skipped in raw mode.
+                            if (!dbf._rawCharacterFields) {
+                                while (len > 0 && buffer[offset + len - 1] === 0x20) --len;
+                            }
                             value = substrAt(offset, len, encoding);
                             offset += field.size;
                             break;
@@ -539,7 +685,7 @@ async function readRecordsFromDBF(dbf: DBFFile, maxCount: number) {
                             break;
 
                         case 'M': // Memo
-                            let blockIndex = dbf._version === 0x30
+                            let blockIndex = isVfp9FileVersion(dbf._version!)
                                 ? int32At(offset, len)
                                 : parseInt(substrAt(offset, len, encoding));
                             offset += len;
@@ -619,7 +765,7 @@ async function readRecordsFromDBF(dbf: DBFFile, maxCount: number) {
                                 }
 
                                 // Handle first/next block of VFP9 or FoxPro 2 memo data.
-                                else if (dbf._version === 0x30 || dbf._version === 0xf5) {
+                                else if (isVfp9FileVersion(dbf._version!) || dbf._version === 0xf5) {
                                     // Memo header
                                     // 00 - 03: Next free block
                                     // 04 - 05: Not used
@@ -689,11 +835,84 @@ async function readRecordsFromDBF(dbf: DBFFile, maxCount: number) {
         return records;
     }
     finally {
-        // Close the file(s).
+        // Close the file(s) and release the shared read lock.
         if (fd) await close(fd);
         if (memoFd) await close(memoFd);
+        if (readLock) await readLock.locker.unlock(readLock.range);
     }
 };
+
+
+
+
+// Private implementation of DBFFile#readRecords when reading in CDX tag order.
+async function readRecordsFromIndex(dbf: DBFFile, options: ReadRecordsOptions): Promise<Array<Record<string, unknown>>> {
+    await markIndexStaleIfChanged(dbf);
+    if (dbf._indexDirty) await reindexDBF(dbf);
+    const cdx = dbf._cdx;
+    if (!cdx) throw new Error(`No CDX index is open for '${dbf.path}'.`);
+    const tag = cdx.findTag(options.index);
+    if (!tag) throw new Error(`CDX tag '${options.index}' not found in '${dbf.path}'.`);
+    const maxCount = options.maxCount ?? 10000000;
+
+    return await withIndexReadLock(dbf, cdx.path, async () => {
+        // Read every record once (including deleted ones) so that the array index maps to record number.
+        const savedIncludeDeleted = dbf._includeDeletedRecords;
+        dbf._includeDeletedRecords = true;
+        dbf._recordsRead = 0;
+        let all: Array<Record<string, unknown> & {[DELETED]?: true}>;
+        try {
+            all = await readRecordsFromDBF(dbf, Number.MAX_SAFE_INTEGER);
+        }
+        finally {
+            dbf._includeDeletedRecords = savedIncludeDeleted;
+        }
+
+        const records: Array<Record<string, unknown>> = [];
+        for (const entry of cdx.iterateTag(tag.name)) {
+            // CDX record numbers are 1-based; the DBF record array is 0-based.
+            const record = all[entry.recno - 1];
+            if (!record) continue;
+            if (record[DELETED] && !dbf._includeDeletedRecords) continue;
+            records.push(record);
+        }
+        if (tag.descending) records.reverse();
+        return records.slice(0, maxCount);
+    });
+}
+
+
+
+
+// Private implementation of DBFFile#seek: encodes the value and locates the matching index entry.
+async function seekInIndex(dbf: DBFFile, tagName: string, value: unknown): Promise<Record<string, unknown> | undefined> {
+    await markIndexStaleIfChanged(dbf);
+    if (dbf._indexDirty) await reindexDBF(dbf);
+    const cdx = dbf._cdx;
+    if (!cdx) throw new Error(`No CDX index is open for '${dbf.path}'.`);
+    const tag = cdx.findTag(tagName);
+    if (!tag) throw new Error(`CDX tag '${tagName}' not found in '${dbf.path}'.`);
+    const search = encodeCdxKey(value, tag.keyType, tag.keyLength, collationForName(tag.collation), getEncoding(dbf._encoding));
+
+    return await withIndexReadLock(dbf, cdx.path, async () => {
+        const entry = cdx.seekTag(tag.name, search);
+        if (!entry) return undefined;
+
+        const savedIncludeDeleted = dbf._includeDeletedRecords;
+        dbf._includeDeletedRecords = true;
+        dbf._recordsRead = 0;
+        let all: Array<Record<string, unknown> & {[DELETED]?: true}>;
+        try {
+            all = await readRecordsFromDBF(dbf, Number.MAX_SAFE_INTEGER);
+        }
+        finally {
+            dbf._includeDeletedRecords = savedIncludeDeleted;
+        }
+        const record = all[entry.recno - 1];
+        if (!record || (record[DELETED] && !dbf._includeDeletedRecords)) return undefined;
+        return record;
+    });
+}
 
 
 
@@ -746,6 +965,9 @@ async function appendRecordsToDBF(dbf: DBFFile, records: Array<Record<string, un
         // Update the date of last update.
         await writeDateOfLastUpdate(fd);
 
+        // Mark the index stale; it is rebuilt lazily (on close or the next index read).
+        if (dbf._cdx || dbf._indexDefinitions) dbf._indexDirty = true;
+
         // Return the same DBFFile instance.
         return dbf;
     }
@@ -793,6 +1015,7 @@ async function updateRecordsInDBF(dbf: DBFFile, updates: Array<{index: number, r
 
         // Update the date of last update.
         await writeDateOfLastUpdate(fd);
+        if (dbf._cdx || dbf._indexDefinitions) dbf._indexDirty = true;
         return dbf;
     }
     finally {
@@ -801,6 +1024,26 @@ async function updateRecordsInDBF(dbf: DBFFile, updates: Array<{index: number, r
         if (fd) await close(fd);
     }
 };
+
+
+
+
+// Private implementation of DBFFile#deleteRecord / #undeleteRecord.
+async function setRecordDeleted(dbf: DBFFile, index: number, deleted: boolean): Promise<DBFFile> {
+    assertValidRecordIndex(dbf, index);
+    if (dbf._locking) await assertCanWriteRecords(dbf, [index]);
+    const fd = await open(dbf.path, 'r+');
+    try {
+        const position = dbf._headerLength + index * dbf._recordLength;
+        await write(fd, Buffer.from([deleted ? 0x2a : 0x20]), 0, 1, position);
+        await writeDateOfLastUpdate(fd);
+    }
+    finally {
+        await close(fd);
+    }
+    if (dbf._cdx || dbf._indexDefinitions) dbf._indexDirty = true;
+    return dbf;
+}
 
 
 
@@ -905,7 +1148,7 @@ async function encodeRecord(
 
 // Decodes the memo block index already stored in a record buffer (used to reuse an existing memo chain).
 function decodeMemoBlockIndex(dbf: DBFFile, field: FieldDescriptor, buffer: Buffer, offset: number): number {
-    if (dbf._version === 0x30) return buffer.readInt32LE(offset);
+    if (isVfp9FileVersion(dbf._version!)) return buffer.readInt32LE(offset);
     const text = iconv.decode(buffer.slice(offset, offset + field.size), 'ascii').trim();
     const blockIndex = parseInt(text, 10);
     return isNaN(blockIndex) ? 0 : blockIndex;
@@ -916,7 +1159,7 @@ function decodeMemoBlockIndex(dbf: DBFFile, field: FieldDescriptor, buffer: Buff
 
 // Encodes a memo block index into a record buffer, in the format appropriate to the file version.
 function encodeMemoBlockIndex(dbf: DBFFile, field: FieldDescriptor, buffer: Buffer, offset: number, blockIndex: number, encoding: string): void {
-    if (dbf._version === 0x30) {
+    if (isVfp9FileVersion(dbf._version!)) {
         buffer.writeInt32LE(blockIndex, offset);
         return;
     }
@@ -954,8 +1197,10 @@ async function assertCanWriteFile(dbf: DBFFile): Promise<void> {
 async function assertCanWriteRecords(dbf: DBFFile, indices: number[]): Promise<void> {
     const locker = dbf._getLocker();
     const fileRange = fileLockRange(dbf);
-    if (!locker.holdsRange(fileRange) && (await locker.probe(fileRange)).locked) {
-        throw new LockError(`Cannot write '${dbf.path}': the file is locked by another process`, 'EBUSY');
+    // A foreign *exclusive* lock (an appender) blocks record writes; a shared lock (a concurrent read
+    // or reindex) does not, since the record bytes are a different range.
+    if (!locker.holdsRange(fileRange) && await hasForeignExclusiveLock(locker, fileRange)) {
+        throw new LockError(`Cannot write '${dbf.path}': the file is locked for writing by another process`, 'EBUSY');
     }
     for (const index of indices) {
         const range = recordLockRange(dbf, index);
@@ -964,6 +1209,23 @@ async function assertCanWriteRecords(dbf: DBFFile, indices: number[]): Promise<v
         if (probe.locked) throw new LockError(`Cannot write record ${index} in '${dbf.path}': it is locked by another process`, 'EBUSY');
         throw new LockError(`Cannot write record ${index} in '${dbf.path}': call lockRecord(${index}) before writing when locking is enabled`, 'ENOLOCK');
     }
+}
+
+
+
+
+// Probes whether an exclusive lock is held on a range by another process/handle: a shared lock is
+// attempted (and released), which fails only when an exclusive lock is present.
+async function hasForeignExclusiveLock(locker: FileLocker, range: LockRange): Promise<boolean> {
+    try {
+        await locker.lock(range, 'read');
+    }
+    catch (err) {
+        if (err instanceof LockError && err.code === 'EBUSY') return true;
+        throw err;
+    }
+    await locker.unlock(range);
+    return false;
 }
 
 
@@ -1026,9 +1288,450 @@ function memoPathFor(path: string, version: number): string {
 
 
 
+// Computes the production CDX path (same base name as the DBF, .cdx extension).
+function cdxPathFor(dbfPath: string): string {
+    return dbfPath.slice(0, -extname(dbfPath).length) + '.cdx';
+}
+
+
+
+
+// Opens and verifies the production CDX index for a DBF opened with the `cdx` option.
+async function openCdxForResult(result: DBFFile, dbfPath: string, fileVersion: number, cdxOption: CdxOption): Promise<void> {
+    const cdxVersion = typeof cdxOption === 'object' ? cdxOption.version : cdxOption;
+    // A Visual FoxPro CDX requires a VFP9 table (0x30/0x31). A FoxPro 2.x CDX pairs with a 0xf5 table
+    // (with memo) or a 0x03 table (no memo) — the latter shares its version byte with dBase III+, so
+    // the presence of the `.cdx` is what distinguishes it.
+    const dbfMatches = cdxVersion === 0x30
+        ? isVfp9FileVersion(fileVersion)
+        : (fileVersion === 0xf5 || fileVersion === 0x03);
+    if (!dbfMatches) {
+        throw new Error(`CDX compatibility 0x${cdxVersion.toString(16)} does not match DBF version 0x${fileVersion.toString(16)} for '${dbfPath}'.`);
+    }
+    let cdxPath: string;
+    if (typeof cdxOption === 'object' && cdxOption.path) {
+        cdxPath = cdxOption.path;
+    }
+    else {
+        cdxPath = cdxPathFor(dbfPath);
+        if (await stat(cdxPath).catch(() => 'missing') === 'missing') {
+            const upper = cdxPath.slice(0, -4) + '.CDX';
+            if (await stat(upper).catch(() => 'missing') !== 'missing') cdxPath = upper;
+        }
+    }
+    if (await stat(cdxPath).catch(() => 'missing') === 'missing') {
+        throw new Error(`CDX index not found for '${dbfPath}': expected '${cdxPath}'.`);
+    }
+    const cdx = await withIndexReadLock(result, cdxPath, () => CdxIndex.open(cdxPath));
+    if ((cdx.header.options & CDX_TYPE_COMPOUND) === 0) {
+        throw new Error(`'${cdxPath}' is not a compound CDX index.`);
+    }
+    // Infer each tag's key type: from a simple field-name expression, else from the expression's
+    // static result type (e.g. `val(...)` -> numeric), so key decoding and padding are correct.
+    for (const tag of cdx.tags) {
+        const field = result.fields.find(f => f.name.toLowerCase() === tag.keyExpression.toLowerCase());
+        if (field) {
+            tag.keyType = fieldTypeToKeyType(field.type);
+            continue;
+        }
+        try {
+            const expression = CdxExpression.parse(tag.keyExpression, {compat: result._expressionCompat});
+            tag.keyType = expression.inferKeyType(name => {
+                const referenced = result.fields.find(f => f.name.toLowerCase() === name.toLowerCase());
+                return referenced ? fieldTypeToKeyType(referenced.type) : undefined;
+            });
+        }
+        catch {
+            tag.keyType = 'C';
+        }
+    }
+    result._cdx = cdx;
+    result.indexes = [cdx];
+    result.tags = cdx.tags;
+    result._indexMarker = indexMarkerFor(result);
+}
+
+
+
+
+function fieldTypeToKeyType(type: FieldDescriptor['type']): CdxKeyType {
+    switch (type) {
+        case 'N': case 'F': case 'I': case 'Y': case 'B': return 'N';
+        case 'D': return 'D';
+        case 'T': return 'T';
+        case 'L': return 'L';
+        default: return 'C';
+    }
+}
+
+
+
+
+// The index key length for a simple field expression, matching FoxPro's fixed-width key encodings.
+// Character fields depend on the collation: MACHINE uses one byte per character, other sequences
+// (e.g. GENERAL) use two.
+function fieldKeyLength(field: FieldDescriptor, collation: CdxCollation): number {
+    switch (field.type) {
+        case 'I': return 4;
+        case 'N': case 'F': case 'Y': case 'B': case 'D': case 'T': return 8;
+        case 'L': return 1;
+        default: return collation.keyLengthFor(field.size);
+    }
+}
+
+
+
+
+function simpleFieldFor(expression: CdxExpression, fields: FieldDescriptor[]): FieldDescriptor | undefined {
+    if (expression.referencedFields.length !== 1) return undefined;
+    const name = expression.referencedFields[0].toLowerCase();
+    return fields.find(field => field.name.toLowerCase() === name);
+}
+
+
+
+
+// Builds an empty tag (no keys) for a newly created index.
+function emptyBuildTag(def: IndexDefinition, fields: FieldDescriptor[]): CdxBuildTag {
+    const expression = CdxExpression.parse(def.expression);
+    const field = simpleFieldFor(expression, fields);
+    const collation = collationForName(def.collation);
+    return {
+        name: def.tag,
+        keyExpression: def.expression,
+        forExpression: def.for,
+        keyLength: field ? fieldKeyLength(field, collation) : 240,
+        keyType: field ? fieldTypeToKeyType(field.type) : 'C',
+        descending: !!def.descending,
+        unique: !!def.unique,
+        collation: def.collation,
+        keys: [],
+    };
+}
+
+
+
+
+function makeEvalContext(record: Record<string, unknown> & {[DELETED]?: true}): CdxEvalContext {
+    return {
+        getField: name => {
+            const key = Object.keys(record).find(k => k.toLowerCase() === name.toLowerCase());
+            const value = key ? record[key] : undefined;
+            return value === undefined || value === null ? null : value as CdxValue;
+        },
+        isDeleted: () => record[DELETED] === true,
+    };
+}
+
+
+
+
+function truthyValue(value: CdxValue): boolean {
+    if (value === null) return false;
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number') return value !== 0;
+    if (value instanceof Date) return !isNaN(value.getTime());
+    return value.length > 0;
+}
+
+
+
+
+// Builds a tag's sorted key list from the current records, applying the key and FOR expressions.
+function buildTagFromRecords(dbf: DBFFile, def: IndexDefinition, records: Array<Record<string, unknown> & {[DELETED]?: true}>, compat = dbf._expressionCompat): CdxBuildTag {
+    const expression = CdxExpression.parse(def.expression, {compat});
+    const forExpression = def.for ? CdxExpression.parse(def.for, {compat}) : undefined;
+    const field = simpleFieldFor(expression, dbf.fields);
+    const collation = collationForName(def.collation);
+
+    // Determine the key type from the expression's result type, and the key length from a simple
+    // field (preserving the field width, as CodeBase/VFP do) when the types agree, else from samples.
+    const inferred = expression.inferKeyType(name => {
+        const referenced = dbf.fields.find(f => f.name.toLowerCase() === name.toLowerCase());
+        return referenced ? fieldTypeToKeyType(referenced.type) : undefined;
+    });
+    let keyType: CdxKeyType;
+    let keyLength: number;
+    if (field && fieldTypeToKeyType(field.type) === inferred) {
+        keyType = inferred;
+        keyLength = fieldKeyLength(field, collation);
+    }
+    else {
+        keyType = inferred;
+        keyLength = keyType === 'C' ? collation.keyLengthFor(maxTextLength(expression, records)) : keyType === 'L' ? 1 : 8;
+    }
+
+    const keys: Array<{key: Buffer, recno: number}> = [];
+    for (let i = 0; i < records.length; ++i) {
+        const record = records[i];
+        if (record[DELETED]) continue;
+        const context = makeEvalContext(record);
+        if (forExpression && !truthyValue(forExpression.evaluate(context))) continue;
+        const value = expression.evaluate(context);
+        keys.push({key: encodeCdxKey(value, keyType, keyLength, collation, getEncoding(dbf._encoding)), recno: i + 1});
+    }
+    const pad = keyPadByte(keyType);
+    keys.sort((a, b) => compareCdxKeys(a.key, b.key, pad) || a.recno - b.recno);
+    const finalKeys = def.unique ? dedupeKeys(keys, pad) : keys;
+    return {
+        name: def.tag,
+        keyExpression: def.expression,
+        forExpression: def.for,
+        keyLength,
+        keyType,
+        descending: !!def.descending,
+        unique: !!def.unique,
+        collation: def.collation,
+        keys: finalKeys,
+    };
+}
+
+
+
+
+// Keeps only the first key of each equal-key run (unique index behaviour).
+function dedupeKeys(keys: Array<{key: Buffer, recno: number}>, pad: number): Array<{key: Buffer, recno: number}> {
+    const result: Array<{key: Buffer, recno: number}> = [];
+    let previous: Buffer | undefined;
+    for (const entry of keys) {
+        if (previous && compareCdxKeys(previous, entry.key, pad) === 0) continue;
+        result.push(entry);
+        previous = entry.key;
+    }
+    return result;
+}
+
+
+
+
+// Counts how many rebuilt keys equal the stored key for the same record (logically, ignoring pad).
+function countKeyMatches(stored: Map<number, Buffer>, keys: Array<{key: Buffer, recno: number}>, pad: number): number {
+    let matches = 0;
+    for (const entry of keys) {
+        const previous = stored.get(entry.recno);
+        if (previous && compareCdxKeys(previous, entry.key, pad) === 0) ++matches;
+    }
+    return matches;
+}
+
+
+
+
+// Safety net before overwriting an existing tag. If the rebuilt keys match none of the stored keys,
+// the mismatch is either (a) the index was built with different expression semantics (e.g. by
+// Sequiter CodeBase, whose RIGHT() behaves like LEFT()), or (b) every record was legitimately
+// changed. These are distinguished by rebuilding under the *other* compatibility mode: if that
+// reproduces the stored keys, the index belongs to the other mode, so refuse rather than clobber it.
+function assertTagReproducible(dbf: DBFFile, def: IndexDefinition, buildTag: CdxBuildTag, records: Array<Record<string, unknown> & {[DELETED]?: true}>): void {
+    const cdx = dbf._cdx;
+    if (!cdx) return;
+    const existingTag = cdx.findTag(buildTag.name);
+    if (!existingTag) return;
+    let stored: Map<number, Buffer>;
+    try {
+        stored = new Map([...cdx.iterateTag(existingTag.name)].map(entry => [entry.recno, entry.key]));
+    }
+    catch {
+        return;
+    }
+    if (!stored.size) return;
+    if (countKeyMatches(stored, buildTag.keys, keyPadByte(buildTag.keyType)) > 0) return;
+
+    const alternative = dbf._expressionCompat === 'codebase' ? 'standard' : 'codebase';
+    let alternativeTag: CdxBuildTag;
+    try {
+        alternativeTag = buildTagFromRecords(dbf, def, records, alternative);
+    }
+    catch {
+        return;
+    }
+    if (countKeyMatches(stored, alternativeTag.keys, keyPadByte(alternativeTag.keyType)) > 0) {
+        throw new Error(
+            `Refusing to reindex tag '${buildTag.name}' in '${dbf.path}': the rebuilt keys match none of the ` +
+            `${stored.size} existing key(s), but they are reproduced under the '${alternative}' expression semantics. ` +
+            `Re-open with { expressionCompat: '${alternative}' }, or pass { force: true } to reindex anyway.`);
+    }
+}
+
+
+
+
+function maxTextLength(expression: CdxExpression, records: Array<Record<string, unknown> & {[DELETED]?: true}>): number {
+    let max = 1;
+    for (const record of records) {
+        if (record[DELETED]) continue;
+        const value = expression.evaluate(makeEvalContext(record));
+        const length = value === null ? 0 : String(value).length;
+        if (length > max) max = length;
+    }
+    return Math.min(max, 240);
+}
+
+
+
+
+// Rebuilds the production CDX (or one tag) from the DBF's current records.
+// Refreshes the cached DBF header fields from disk, so that reindexing and staleness checks observe
+// changes made by other processes (appends, edits, deletes).
+async function refreshDbfHeader(dbf: DBFFile): Promise<void> {
+    const fd = await open(dbf.path, 'r');
+    try {
+        const buffer = Buffer.alloc(32);
+        await read(fd, buffer, 0, 32, 0);
+        dbf.recordCount = buffer.readInt32LE(4);
+        dbf.dateOfLastUpdate = createDate(buffer.readUInt8(1) + 1900, buffer.readUInt8(2), buffer.readUInt8(3));
+        dbf._headerLength = buffer.readUInt16LE(8);
+        dbf._recordLength = buffer.readUInt16LE(10);
+    }
+    finally {
+        await close(fd);
+    }
+}
+
+
+
+
+// A fingerprint of the DBF header used to detect on-disk changes since the index was last built.
+function indexMarkerFor(dbf: DBFFile): string {
+    return `${dbf.recordCount}:${dbf.dateOfLastUpdate.getTime()}:${dbf._headerLength}:${dbf._recordLength}`;
+}
+
+
+
+
+// Marks the index stale when the DBF header on disk differs from the last indexed marker, so that
+// changes made by another process (or another instance) are picked up before an index read/seek.
+async function markIndexStaleIfChanged(dbf: DBFFile): Promise<void> {
+    if (dbf._indexDirty) return;
+    if (!dbf._cdx && !dbf._indexDefinitions) return;
+    await refreshDbfHeader(dbf);
+    if (dbf._indexMarker !== undefined && dbf._indexMarker !== indexMarkerFor(dbf)) {
+        dbf._indexDirty = true;
+    }
+}
+
+
+
+
+// Reads every record (including deleted) with character fields left padded to their field width, for
+// index key computation (FoxPro concatenates padded fields, so trimming must not happen here).
+async function readRecordsForIndex(dbf: DBFFile): Promise<Array<Record<string, unknown> & {[DELETED]?: true}>> {
+    const savedRaw = dbf._rawCharacterFields;
+    const savedIncludeDeleted = dbf._includeDeletedRecords;
+    dbf._rawCharacterFields = true;
+    dbf._includeDeletedRecords = true;
+    dbf._recordsRead = 0;
+    try {
+        return await readRecordsFromDBF(dbf, Number.MAX_SAFE_INTEGER);
+    }
+    finally {
+        dbf._rawCharacterFields = savedRaw;
+        dbf._includeDeletedRecords = savedIncludeDeleted;
+    }
+}
+
+
+
+
+// Private implementation of DBFFile#reindex
+async function reindexDBF(dbf: DBFFile, tagName?: string, force = false): Promise<void> {
+    const definitions: IndexDefinition[] = dbf._indexDefinitions ?? dbf._cdx?.tags.map(tag => ({
+        tag: tag.name,
+        expression: tag.keyExpression,
+        for: tag.forExpression,
+        descending: tag.descending,
+        unique: tag.unique,
+        collation: tag.collation,
+    })) ?? [];
+    if (!definitions || !definitions.length) throw new Error(`No CDX index definitions to reindex for '${dbf.path}'.`);
+    const selected = tagName ? definitions.filter(def => def.tag.toLowerCase() === tagName.toLowerCase()) : definitions;
+    if (!selected.length) throw new Error(`CDX tag '${tagName}' not found in '${dbf.path}'.`);
+
+    const cdxPath = dbf._cdx?.path ?? cdxPathFor(dbf.path);
+
+    // Hold the exclusive index lock across the whole read-rebuild-write. If it were only taken around
+    // the write, a reindex that read an older DBF snapshot could still be the last to write and clobber
+    // a newer index built by another process.
+    const locker = dbf._locking ? dbf._getCdxLocker() : undefined;
+    const range = indexLockRange(dbf);
+    const alreadyHeld = locker ? locker.holdsRange(range) : false;
+    if (locker && !alreadyHeld) await locker.lock(range, 'write', {wait: true, timeoutMs: 30000});
+    try {
+        // Read the DBF under a shared file lock, so we wait for an in-progress writer rather than
+        // reading a half-appended file (and do not trip the lock-aware read guard). The header is
+        // refreshed inside the lock so the record count is current.
+        const fileLocker = dbf._locking ? dbf._getLocker() : undefined;
+        const fileRange = fileLockRange(dbf);
+        const fileAlreadyHeld = fileLocker ? fileLocker.holdsRange(fileRange) : false;
+        if (fileLocker && !fileAlreadyHeld) await fileLocker.lock(fileRange, 'read', {wait: true, timeoutMs: 30000});
+        let records: Array<Record<string, unknown> & {[DELETED]?: true}>;
+        try {
+            await refreshDbfHeader(dbf);
+            records = await readRecordsForIndex(dbf);
+        }
+        finally {
+            if (fileLocker && !fileAlreadyHeld) await fileLocker.unlock(fileRange);
+        }
+        const buildTags = selected.map(def => buildTagFromRecords(dbf, def, records));
+        if (!force) selected.forEach((def, i) => assertTagReproducible(dbf, def, buildTags[i], records));
+        await writeIndexFile(cdxPath, buildCdx(buildTags, true));
+    }
+    finally {
+        if (locker && !alreadyHeld) await locker.unlock(range);
+    }
+    dbf._indexDefinitions = definitions;
+    await dbf.openIndex(cdxPath);
+    await setStructuralIndexFlag(dbf.path);
+    dbf._indexDirty = false;
+    dbf._indexMarker = indexMarkerFor(dbf);
+}
+
+
+
+
+// Sets the DBF header's structural (production) CDX flag (byte 0x1C, bit 0x01).
+async function setStructuralIndexFlag(dbfPath: string): Promise<void> {
+    const fd = await open(dbfPath, 'r+');
+    try {
+        const buffer = Buffer.alloc(1);
+        await read(fd, buffer, 0, 1, 0x1C);
+        buffer[0] |= 0x01;
+        await write(fd, buffer, 0, 1, 0x1C);
+    }
+    finally {
+        await close(fd);
+    }
+}
+
+
+
+
+// Writes the index file. It first tries an atomic replace (temp file + rename), so non-locking
+// readers never see a partial file. Windows refuses to rename over a file that another handle has
+// open — which is the case whenever the index lock is held — so it falls back to an in-place write,
+// which is safe for lock-aware readers because the caller holds the exclusive index lock while
+// readers hold a shared lock.
+async function writeIndexFile(path: string, buffer: Buffer): Promise<void> {
+    const temp = `${path}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    await fs.writeFile(temp, buffer);
+    try {
+        await fs.rename(temp, path);
+        return;
+    }
+    catch (err: any) {
+        const transient = err && (err.code === 'EPERM' || err.code === 'EBUSY' || err.code === 'EACCES');
+        await fs.unlink(temp).catch(() => {});
+        if (!transient) throw err;
+    }
+    await fs.writeFile(path, buffer);
+}
+
+
+
+
 // The historical xBase lock offset defaults: FoxPro/SoftC use 4 billion, Clipper/dBASE use 1 billion.
 function defaultLockOffset(version: number | undefined): number {
-    return version === 0x30 || version === 0xf5 ? 4_000_000_000 : 1_000_000_000;
+    return isVfp9FileVersion(version ?? 0) || version === 0xf5 ? 4_000_000_000 : 1_000_000_000;
 }
 
 
@@ -1060,6 +1763,33 @@ function recordLockRange(dbf: DBFFile, index: number): LockRange {
 // The memo file lock covers the memo file's header region.
 function memoLockRange(dbf: DBFFile): LockRange {
     return {start: lockOffsetFor(dbf), length: 512};
+}
+
+
+
+
+// The CDX index file lock covers the index file's header region.
+function indexLockRange(dbf: DBFFile): LockRange {
+    return {start: lockOffsetFor(dbf), length: 512};
+}
+
+
+
+
+// Runs an index read while holding a shared index lock, so it is mutually excluded with a reindex
+// (which holds the exclusive lock). A no-op unless locking is enabled.
+async function withIndexReadLock<T>(dbf: DBFFile, cdxPath: string, action: () => Promise<T>): Promise<T> {
+    if (!dbf._locking) return action();
+    const locker = dbf._getCdxLocker(cdxPath);
+    const range = indexLockRange(dbf);
+    const alreadyHeld = locker.holdsRange(range);
+    if (!alreadyHeld) await locker.lock(range, 'read', {wait: true, timeoutMs: 10000});
+    try {
+        return await action();
+    }
+    finally {
+        if (!alreadyHeld) await locker.unlock(range);
+    }
 }
 
 

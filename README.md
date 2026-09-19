@@ -41,6 +41,13 @@ Read and write .dbf (dBase III, dBase IV, FoxPro and Visual FoxPro) files in Nod
   - file locks and record locks, probed freshly from the OS on every operation (never cached)
   - opt-in via `{locking: true}`, at which point writes require an explicit lock and lock-aware reads are refused while a
     blocking file lock is held; see [LOCKING.md](./LOCKING.md)
+- CDX compound index support (read and write), including the production `.cdx` that shares the DBF's name
+  - opt in with `{cdx: 0x30}` (Visual FoxPro 9) or `{cdx: 0xf5}` (FoxPro 2.x)
+  - read records in tag order (`readRecords({index})`), seek exact keys (`seek`), create tags with key/FOR
+    expressions, and rebuild with `reindex()`
+  - open with `{expressionCompat: 'codebase'}` for indexes built by Sequiter CodeBase (whose `RIGHT()` behaves
+    like `LEFT()`); reindexing refuses to clobber an index whose semantics don't match
+  - see [CDX.md](./CDX.md)
 - Can specify character encodings either per-file or per-field.
   - the default encoding is `'ISO-8859-1'` (also known as latin 1)
   - example per-file encoding: `DBFFile.open(<path>, {encoding: 'EUC-JP'})`

@@ -115,12 +115,12 @@ describe('Writing a DBF file', () => {
         {
             description: `DBF with unsupported version`,
             filename: 'dbase_83.dbf',
-            options: {fileVersion: 0x31 as any},
+            options: {fileVersion: 0x99 as any},
             recordCount: 0,
             newFields: [],
             newRecord: record => record,
             firstRecord: {},
-            error: 'Invalid file version 49',
+            error: 'Invalid file version 153',
         },
         {
             description: `DBF with unsupported field type`,

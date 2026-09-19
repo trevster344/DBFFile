@@ -43,7 +43,7 @@ export class MemoFile {
             if (version === 0x8b) {
                 header.writeUInt32LE(blockSize, 4);
             }
-            else if (version === 0x30 || version === 0xf5) {
+            else if (version === 0x30 || version === 0x31 || version === 0xf5) {
                 header.writeUInt32BE(nextFree, 0);
                 header.writeUInt16BE(blockSize, 6);
             }
