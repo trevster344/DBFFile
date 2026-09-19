@@ -1,4 +1,7 @@
 .vscode/
+.github/
+.npmrc
+local/
 dist/test/
 scripts/
 src/
@@ -9,4 +12,5 @@ typings/
 *.js.map
 *.peg
 *.log
+*.tgz
 tsconfig.json
