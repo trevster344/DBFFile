@@ -55,9 +55,44 @@ Read and write .dbf (dBase III, dBase IV, FoxPro and Visual FoxPro) files in Nod
   - supported encodings are listed [here](https://github.com/ashtuchkin/iconv-lite/wiki/Supported-Encodings).
 - All operations are asynchronous and return a promise
 
+### About this fork
+
+This is [trevster344](https://github.com/trevster344)'s fork of
+[yortus/DBFFile](https://github.com/yortus/DBFFile), published to GitHub Packages as
+**`@trevster344/dbffile`**. It tracks upstream and adds the following (from the merged PRs):
+
+- **Memo file writes** — create and write `M` (memo) fields for dBase III (`0x83`), dBase IV (`0x8b`),
+  VFP9 (`0x30`) and FoxPro 2 (`0xf5`) memo files (`.dbt`/`.fpt`), reusing an existing block chain when
+  the new value fits and otherwise appending a new one.
+- **In-place record updates** — `updateRecord(index, record)` / `updateRecords([...])` rewrite only the
+  affected record bytes (and any new memo data), instead of rewriting the whole file.
+- **Optional multi-user locking** — dBase/FoxPro/Clipper-compatible file and record locks via native
+  `LockFileEx` (Windows) / `fcntl` (POSIX), opt in with `{locking: true}`; see [LOCKING.md](./LOCKING.md).
+- **CDX compound index support** — read and write FoxPro/Visual FoxPro `.cdx` compound indexes,
+  including the production `.cdx` that shares the DBF's name: ordered reads (`readRecords({index})`),
+  `seek`, expression/`FOR`/unique/descending tags, `reindex()`, MACHINE and GENERAL collations, and an
+  opt-in `{expressionCompat: 'codebase'}` mode for indexes built by Sequiter CodeBase; see [CDX.md](./CDX.md).
+- Accepts the VFP9 `0x31` file version.
+
+The public API is otherwise unchanged, so `import {DBFFile} from '@trevster344/dbffile'` behaves the
+same as the upstream `dbffile` package.
+
 ### Installation
 
-`npm install dbffile` or `yarn add dbffile`
+This fork is published to **GitHub Packages**. Configure npm to use the GitHub registry for the
+`@trevster344` scope and authenticate with a token that has at least `read:packages`:
+
+```
+# .npmrc
+@trevster344:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=<your-token>
+```
+
+```
+npm install @trevster344/dbffile
+```
+
+The upstream package remains available as `npm install dbffile`.
 
 ### Example: read all records in a .dbf file using for-await-of
 

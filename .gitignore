@@ -7,3 +7,6 @@ node_modules/
 
 # Local scratch folder for ad-hoc DBF/DBT/FPT/CDX files under test.
 local/
+
+# npm auth token (never commit).
+.npmrc

@@ -1,9 +1,12 @@
 {
-  "name": "dbffile",
-  "version": "1.13.0",
+  "name": "@trevster344/dbffile",
+  "version": "1.14.1",
   "description": "Read and write .dbf (dBase III & Visual FoxPro) files in Node.js",
   "main": "dist/index.js",
   "typings": "dist/index.d.ts",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
   "scripts": {
     "build": "tsc -p src && tsc -p test && ncp test/fixtures dist/test/fixtures",
     "build:watch": "tsc -w -p src & (ncp test/fixtures dist/test/fixtures && tsc -w -p test)",
@@ -16,7 +19,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yortus/DBFFile.git"
+    "url": "git+https://github.com/trevster344/DBFFile.git"
   },
   "keywords": [
     "dbf",
@@ -32,9 +35,9 @@
   },
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/yortus/DBFFile/issues"
+    "url": "https://github.com/trevster344/DBFFile/issues"
   },
-  "homepage": "https://github.com/yortus/DBFFile",
+  "homepage": "https://github.com/trevster344/DBFFile",
   "devDependencies": {
     "@types/chai": "^4.1.7",
     "@types/mocha": "^8.2.2",
