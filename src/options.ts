@@ -1,5 +1,6 @@
 import {encodingExists} from 'iconv-lite';
 import {FileVersion, isValidFileVersion} from './file-version';
+import {CdxOption, CdxVersion, ExpressionCompat} from './cdx/cdx-format';
 
 
 
@@ -39,6 +40,49 @@ export interface OpenOptions {
      * 1,000,000,000 for dBASE/Clipper files.
      */
     lockOffset?: number;
+
+    /**
+     * Opts in to CDX compound-index usage. The raw version states the assumed index compatibility
+     * (`0x30` for Visual FoxPro 9, `0xf5` for FoxPro 2.x); an object may also carry an explicit path.
+     * When set, the production `<dbf-base>.cdx` (or the given path) is opened and verified. Omit to
+     * ignore any `.cdx` present. CDX is a FoxPro-family index, so only `0x30` and `0xf5` are accepted.
+     * `0x30` requires a VFP9 table (`0x30`/`0x31`); `0xf5` requires a FoxPro 2.x table (`0xf5`, or
+     * `0x03` for a table without a memo field — the version byte `0x03` is shared with dBase III+).
+     */
+    cdx?: CdxOption;
+
+    /**
+     * Expression-evaluation compatibility for index keys and FOR filters. `'standard'` (the default)
+     * follows FoxPro semantics; `'codebase'` reproduces Sequiter CodeBase quirks, notably `RIGHT()`
+     * evaluating as `LEFT()` for variable/subexpression arguments. Use `'codebase'` when reading and
+     * reindexing `.cdx` files originally built by CodeBase.
+     */
+    expressionCompat?: ExpressionCompat;
+}
+
+
+
+
+/** Definition of a CDX tag to create. */
+export interface IndexDefinition {
+
+    /** Tag name (up to 10 characters). */
+    tag: string;
+
+    /** The key expression (e.g. `NAME`, `UPPER(NAME)`, `UPPER(CLASS)+STR(LOCATION)`). */
+    expression: string;
+
+    /** Optional FOR filter expression (e.g. `.NOT. DELETED()`). */
+    for?: string;
+
+    /** Whether the tag is a unique index. */
+    unique?: boolean;
+
+    /** Whether the tag is descending. */
+    descending?: boolean;
+
+    /** The VFP sort sequence (collation) for the tag. Defaults to `MACHINE`. */
+    collation?: string;
 }
 
 
@@ -64,6 +108,24 @@ export interface CreateOptions {
      * Defaults to 4,000,000,000 for FoxPro/VFP files and 1,000,000,000 for dBASE/Clipper files.
      */
     lockOffset?: number;
+
+    /**
+     * Opts in to CDX compound-index usage. The raw version states the assumed index compatibility
+     * (`0x30` for Visual FoxPro 9, `0xf5` for FoxPro 2.x); an object may also carry an explicit path.
+     * When set, the production `<dbf-base>.cdx` (or the given path) is opened and verified. Omit to
+     * ignore any `.cdx` present. CDX is a FoxPro-family index, so only `0x30` and `0xf5` are accepted.
+     */
+    cdx?: CdxVersion;
+
+    /** CDX tags to create alongside the DBF. */
+    indexes?: IndexDefinition[];
+
+    /**
+     * Expression-evaluation compatibility for index keys and FOR filters. `'standard'` (the default)
+     * follows FoxPro semantics; `'codebase'` reproduces Sequiter CodeBase quirks, notably `RIGHT()`
+     * evaluating as `LEFT()` for variable/subexpression arguments.
+     */
+    expressionCompat?: ExpressionCompat;
 }
 
 
@@ -76,6 +138,8 @@ export interface NormalisedOpenOptions {
     includeDeletedRecords: boolean;
     locking: boolean;
     lockOffset?: number;
+    cdx?: CdxOption;
+    expressionCompat: ExpressionCompat;
 }
 
 
@@ -88,6 +152,9 @@ export interface NormalisedCreateOptions {
     memoBlockSize: number;
     locking: boolean;
     lockOffset?: number;
+    cdx?: CdxVersion;
+    indexes?: IndexDefinition[];
+    expressionCompat: ExpressionCompat;
 }
 
 
@@ -134,8 +201,16 @@ export function normaliseOpenOptions(options: OpenOptions | undefined): Normalis
         throw new Error(`Invalid 'lockOffset' value ${lockOffset}`);
     }
 
+    // Validate `cdx`.
+    let cdx = options?.cdx;
+    assertValidCdxOption(cdx);
+
+    // Validate `expressionCompat`.
+    let expressionCompat = options?.expressionCompat ?? 'standard';
+    assertValidExpressionCompat(expressionCompat);
+
     // Return a new normalised options object.
-    return {encoding, readMode, includeDeletedRecords, locking, lockOffset};
+    return {encoding, readMode, includeDeletedRecords, locking, lockOffset, cdx, expressionCompat};
 }
 
 
@@ -170,8 +245,29 @@ export function normaliseCreateOptions(options: CreateOptions | undefined): Norm
         throw new Error(`Invalid 'lockOffset' value ${lockOffset}`);
     }
 
+    // Validate `cdx`.
+    let cdx = options?.cdx;
+    if (cdx !== undefined && cdx !== 0x30 && cdx !== 0xf5) {
+        throw new Error(`Invalid 'cdx' version ${cdx} (must be 0x30 or 0xf5)`);
+    }
+
+    // Validate `indexes`.
+    let indexes = options?.indexes;
+    if (indexes !== undefined) {
+        if (!Array.isArray(indexes)) throw new Error(`Invalid 'indexes' value (must be an array)`);
+        for (const index of indexes) {
+            if (!index || typeof index.tag !== 'string' || !index.tag) throw new Error(`Invalid index definition: missing tag name`);
+            if (index.tag.length > 10) throw new Error(`Index tag '${index.tag}' is too long (maximum is 10 chars)`);
+            if (typeof index.expression !== 'string' || !index.expression) throw new Error(`Index tag '${index.tag}': missing key expression`);
+        }
+    }
+
+    // Validate `expressionCompat`.
+    let expressionCompat = options?.expressionCompat ?? 'standard';
+    assertValidExpressionCompat(expressionCompat);
+
     // Return a new normalised options object.
-    return {fileVersion, encoding, memoBlockSize, locking, lockOffset};
+    return {fileVersion, encoding, memoBlockSize, locking, lockOffset, cdx, indexes, expressionCompat};
 }
 
 
@@ -191,5 +287,27 @@ function assertValidEncoding(encoding: unknown): asserts encoding is Encoding {
     }
     else {
         throw new Error(`Invalid encoding value ${encoding}`);
+    }
+}
+
+
+
+
+// Helper function for validating the CDX opt-in (raw version, or an object carrying a version).
+function assertValidCdxOption(cdx: unknown): asserts cdx is CdxOption {
+    if (cdx === undefined) return;
+    const version = typeof cdx === 'object' && cdx !== null ? (cdx as {version?: unknown}).version : cdx;
+    if (version !== 0x30 && version !== 0xf5) {
+        throw new Error(`Invalid 'cdx' version ${String(version)} (must be 0x30 or 0xf5)`);
+    }
+}
+
+
+
+
+// Helper function for validating the expression-compatibility mode.
+function assertValidExpressionCompat(value: unknown): asserts value is ExpressionCompat {
+    if (value !== 'standard' && value !== 'codebase') {
+        throw new Error(`Invalid 'expressionCompat' value ${String(value)} (must be 'standard' or 'codebase')`);
     }
 }
