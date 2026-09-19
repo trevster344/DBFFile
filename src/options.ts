@@ -42,6 +42,20 @@ export interface OpenOptions {
     lockOffset?: number;
 
     /**
+     * When locking is enabled, the time in milliseconds a lock-aware read waits for a contended
+     * **DBF file** lock before giving up. `0` (the default) refuses immediately with `EBUSY`; a
+     * positive value waits up to that long and then fails with `ETIMEDOUT`.
+     */
+    readWaitTimeout?: number;
+
+    /**
+     * When locking is enabled, the time in milliseconds an index read (`readRecords({index})`,
+     * `seek`, opening an index) waits for a contended **index** lock before giving up. Defaults to
+     * 10000; `0` refuses immediately with `EBUSY`.
+     */
+    indexReadWaitTimeout?: number;
+
+    /**
      * Opts in to CDX compound-index usage. The raw version states the assumed index compatibility
      * (`0x30` for Visual FoxPro 9, `0xf5` for FoxPro 2.x); an object may also carry an explicit path.
      * When set, the production `<dbf-base>.cdx` (or the given path) is opened and verified. Omit to
@@ -109,6 +123,12 @@ export interface CreateOptions {
      */
     lockOffset?: number;
 
+    /** See `OpenOptions.readWaitTimeout`. Defaults to 0 (refuse immediately with `EBUSY`). */
+    readWaitTimeout?: number;
+
+    /** See `OpenOptions.indexReadWaitTimeout`. Defaults to 10000. */
+    indexReadWaitTimeout?: number;
+
     /**
      * Opts in to CDX compound-index usage. The raw version states the assumed index compatibility
      * (`0x30` for Visual FoxPro 9, `0xf5` for FoxPro 2.x); an object may also carry an explicit path.
@@ -138,6 +158,8 @@ export interface NormalisedOpenOptions {
     includeDeletedRecords: boolean;
     locking: boolean;
     lockOffset?: number;
+    readWaitTimeout: number;
+    indexReadWaitTimeout: number;
     cdx?: CdxOption;
     expressionCompat: ExpressionCompat;
 }
@@ -152,6 +174,8 @@ export interface NormalisedCreateOptions {
     memoBlockSize: number;
     locking: boolean;
     lockOffset?: number;
+    readWaitTimeout: number;
+    indexReadWaitTimeout: number;
     cdx?: CdxVersion;
     indexes?: IndexDefinition[];
     expressionCompat: ExpressionCompat;
@@ -201,6 +225,12 @@ export function normaliseOpenOptions(options: OpenOptions | undefined): Normalis
         throw new Error(`Invalid 'lockOffset' value ${lockOffset}`);
     }
 
+    // Validate `readWaitTimeout` / `indexReadWaitTimeout`.
+    let readWaitTimeout = options?.readWaitTimeout ?? 0;
+    assertValidTimeout(readWaitTimeout, 'readWaitTimeout');
+    let indexReadWaitTimeout = options?.indexReadWaitTimeout ?? 10000;
+    assertValidTimeout(indexReadWaitTimeout, 'indexReadWaitTimeout');
+
     // Validate `cdx`.
     let cdx = options?.cdx;
     assertValidCdxOption(cdx);
@@ -210,7 +240,7 @@ export function normaliseOpenOptions(options: OpenOptions | undefined): Normalis
     assertValidExpressionCompat(expressionCompat);
 
     // Return a new normalised options object.
-    return {encoding, readMode, includeDeletedRecords, locking, lockOffset, cdx, expressionCompat};
+    return {encoding, readMode, includeDeletedRecords, locking, lockOffset, readWaitTimeout, indexReadWaitTimeout, cdx, expressionCompat};
 }
 
 
@@ -245,6 +275,12 @@ export function normaliseCreateOptions(options: CreateOptions | undefined): Norm
         throw new Error(`Invalid 'lockOffset' value ${lockOffset}`);
     }
 
+    // Validate `readWaitTimeout` / `indexReadWaitTimeout`.
+    let readWaitTimeout = options?.readWaitTimeout ?? 0;
+    assertValidTimeout(readWaitTimeout, 'readWaitTimeout');
+    let indexReadWaitTimeout = options?.indexReadWaitTimeout ?? 10000;
+    assertValidTimeout(indexReadWaitTimeout, 'indexReadWaitTimeout');
+
     // Validate `cdx`.
     let cdx = options?.cdx;
     if (cdx !== undefined && cdx !== 0x30 && cdx !== 0xf5) {
@@ -267,7 +303,7 @@ export function normaliseCreateOptions(options: CreateOptions | undefined): Norm
     assertValidExpressionCompat(expressionCompat);
 
     // Return a new normalised options object.
-    return {fileVersion, encoding, memoBlockSize, locking, lockOffset, cdx, indexes, expressionCompat};
+    return {fileVersion, encoding, memoBlockSize, locking, lockOffset, readWaitTimeout, indexReadWaitTimeout, cdx, indexes, expressionCompat};
 }
 
 
@@ -309,5 +345,15 @@ function assertValidCdxOption(cdx: unknown): asserts cdx is CdxOption {
 function assertValidExpressionCompat(value: unknown): asserts value is ExpressionCompat {
     if (value !== 'standard' && value !== 'codebase') {
         throw new Error(`Invalid 'expressionCompat' value ${String(value)} (must be 'standard' or 'codebase')`);
+    }
+}
+
+
+
+
+// Helper function for validating a lock-wait timeout (a non-negative integer number of milliseconds).
+function assertValidTimeout(value: unknown, name: string): asserts value is number {
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+        throw new Error(`Invalid '${name}' value ${String(value)} (must be a non-negative integer)`);
     }
 }

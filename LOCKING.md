@@ -53,12 +53,19 @@ mistaking a record lock for one.
 Locking is **opt-in**. Pass `{locking: true}` to `open()` or `create()`:
 
 - **Reads** (`readRecords`, iteration) are refused with an `EBUSY` `LockError` while another process
-  holds a blocking **file** lock. Record locks do **not** block reads (read-through).
+  holds a blocking **file** lock. Set `readWaitTimeout` (milliseconds) to wait for the lock instead,
+  up to that long, then fail with `ETIMEDOUT`; the default `0` refuses immediately. Record locks do
+  **not** block reads (read-through).
+- **Index reads** (`readRecords({index})`, `seek`, and opening an index) additionally acquire a shared
+  lock on the `.cdx`. They wait up to `indexReadWaitTimeout` (default `10000` ms) for a concurrent
+  reindex; `0` refuses immediately with `EBUSY`.
 - **Writes** (`appendRecords`, `updateRecord`, `updateRecords`) are refused unless this instance
   holds the required lock:
   - `appendRecords` requires the **file** lock (`lockFile()`).
   - `updateRecord`/`updateRecords` require the **record** lock for each target (`lockRecord(i)`).
   - A foreign lock on the target range always raises `EBUSY`.
+  - The automatic write checks never wait; to wait for a contended lock, pass `{wait: true}` to
+    `lockFile`/`lockRecord` explicitly.
 - Lock state is always **probed freshly from the OS** at the moment of the operation; it is never
   cached on the instance.
 
@@ -68,6 +75,9 @@ are performed — the caller coordinates locking entirely.
 ### API
 
 ```typescript
+// Opt in, and optionally make lock-aware reads wait for a contended lock.
+const dbf = await DBFFile.open(path, {locking: true, readWaitTimeout: 5000, indexReadWaitTimeout: 10000});
+
 await dbf.lockFile();                 // exclusive file lock
 await dbf.unlockFile();
 await dbf.lockRecord(i);              // exclusive record lock
@@ -144,6 +154,12 @@ covers, among others:
 - writes requiring an explicit lock when `locking` is enabled;
 - waiting for a contended lock and proceeding after release;
 - lock release when the holding process is killed;
-- concurrent appends and concurrent memo appends from multiple processes.
+- concurrent appends and concurrent memo appends from multiple processes;
+- lock-aware reads waiting (`readWaitTimeout`) or timing out (`ETIMEDOUT`).
+
+`test/multi-client-mixed.ts` runs several processes that read, append, update, delete and undelete
+against a single DBF (with a production CDX and, in one scenario, a memo file) at the same time,
+asserting that every concurrent read returns a consistent snapshot or a lock refusal, and that the
+final DBF and index are fully consistent.
 
 Run with `npm run build && npm test`.
