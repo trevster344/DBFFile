@@ -41,6 +41,7 @@ Read and write .dbf (dBase III, dBase IV, FoxPro and Visual FoxPro) files in Nod
   - file locks and record locks, probed freshly from the OS on every operation (never cached)
   - opt-in via `{locking: true}`, at which point writes require an explicit lock and lock-aware reads are refused while a
     blocking file lock is held; see [LOCKING.md](./LOCKING.md)
+  - lock-aware reads can instead wait for a contended lock via `readWaitTimeout` (DBF) and `indexReadWaitTimeout` (index)
 - CDX compound index support (read and write), including the production `.cdx` that shares the DBF's name
   - opt in with `{cdx: 0x30}` (Visual FoxPro 9) or `{cdx: 0xf5}` (FoxPro 2.x)
   - read records in tag order (`readRecords({index})`), seek exact keys (`seek`), create tags with key/FOR

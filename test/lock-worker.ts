@@ -23,6 +23,8 @@ interface Payload {
     records?: Array<Record<string, unknown>>;
     wait?: boolean;
     timeoutMs?: number;
+    readWaitTimeout?: number;
+    indexReadWaitTimeout?: number;
 }
 
 
@@ -55,7 +57,11 @@ async function readAll(dbf: DBFFile): Promise<Array<Record<string, unknown>>> {
 
 
 async function perform(payload: Payload): Promise<unknown> {
-    const dbf = await DBFFile.open(payload.dbfPath, {locking: true});
+    const dbf = await DBFFile.open(payload.dbfPath, {
+        locking: true,
+        readWaitTimeout: payload.readWaitTimeout,
+        indexReadWaitTimeout: payload.indexReadWaitTimeout,
+    });
     try {
         switch (payload.op) {
 

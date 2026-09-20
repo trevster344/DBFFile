@@ -195,6 +195,57 @@ describe('Locking', function () {
         }
     });
 
+    it('waits for a contended file lock when readWaitTimeout is set', async () => {
+        const dbfPath = await createDbf('locking-readwait.dbf',
+            [{name: 'ID', type: 'N', size: 5}],
+            [{ID: 1}]);
+        try {
+            const holder = new Worker({op: 'lockFileHold', dbfPath});
+            await holder.start();
+            await holder.waitForMessage('locked');
+
+            const reader = new Worker({op: 'read', dbfPath, readWaitTimeout: 5000});
+            await reader.start();
+            const pending = reader.getResult();
+
+            await delay(300);
+            expect(holder.child.exitCode, 'the reader must still be waiting').equals(null);
+            holder.send('release');
+            await holder.getResult();
+
+            const read = await pending;
+            expect(read.ok).equals(true);
+            expect(read.first.ID).equals(1);
+        }
+        finally {
+            await cleanup(dbfPath);
+        }
+    });
+
+    it('times out a waiting read when the file lock is not released in time', async () => {
+        const dbfPath = await createDbf('locking-readtimeout.dbf',
+            [{name: 'ID', type: 'N', size: 5}],
+            [{ID: 1}]);
+        try {
+            const holder = new Worker({op: 'lockFileHold', dbfPath});
+            await holder.start();
+            await holder.waitForMessage('locked');
+
+            const reader = new Worker({op: 'read', dbfPath, readWaitTimeout: 300});
+            await reader.start();
+            let error: any;
+            try { await reader.getResult(); } catch (err) { error = err; }
+            expect(error, 'a waiting read must time out while the file lock is held').to.be.instanceOf(Error);
+            expect(error.message).to.match(/Timed out/i);
+
+            holder.send('release');
+            await holder.getResult();
+        }
+        finally {
+            await cleanup(dbfPath);
+        }
+    });
+
     it('requires an explicit lock before writing when locking is enabled', async () => {
         const dbfPath = await createDbf('locking-enforce.dbf',
             [{name: 'ID', type: 'N', size: 5}, {name: 'VAL', type: 'N', size: 10}],

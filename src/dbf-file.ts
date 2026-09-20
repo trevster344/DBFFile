@@ -232,6 +232,8 @@ export class DBFFile {
     _locking = false;
     _lockOffset?: number;
     _expressionCompat: ExpressionCompat = 'standard';
+    _readWaitTimeout = 0;
+    _indexReadWaitTimeout = 10000;
     _memoBlockSize = 512;
     _recordsRead = 0;
     _headerLength = 0;
@@ -376,6 +378,8 @@ async function openDBF(path: string, opts?: OpenOptions): Promise<DBFFile> {
         result._locking = options.locking;
         result._lockOffset = options.lockOffset;
         result._expressionCompat = options.expressionCompat;
+        result._readWaitTimeout = options.readWaitTimeout;
+        result._indexReadWaitTimeout = options.indexReadWaitTimeout;
         result._recordsRead = 0;
         result._headerLength = headerLength;
         result._recordLength = recordLength;
@@ -502,6 +506,8 @@ async function createDBF(path: string, fields: FieldDescriptor[], opts?: CreateO
         result._locking = options.locking;
         result._lockOffset = options.lockOffset;
         result._expressionCompat = options.expressionCompat;
+        result._readWaitTimeout = options.readWaitTimeout;
+        result._indexReadWaitTimeout = options.indexReadWaitTimeout;
         result._memoBlockSize = options.memoBlockSize;
         result._recordsRead = 0;
         result._headerLength = headerLength;
@@ -535,8 +541,9 @@ async function readRecordsFromDBF(dbf: DBFFile, maxCount: number) {
             const locker = dbf._getLocker();
             const range = fileLockRange(dbf);
             if (!locker.holdsRange(range)) {
+                const wait = dbf._readWaitTimeout > 0;
                 try {
-                    await locker.lock(range, 'read');
+                    await locker.lock(range, 'read', wait ? {wait: true, timeoutMs: dbf._readWaitTimeout} : undefined);
                 }
                 catch (err) {
                     if (err instanceof LockError && err.code === 'EBUSY') {
@@ -1783,7 +1790,10 @@ async function withIndexReadLock<T>(dbf: DBFFile, cdxPath: string, action: () =>
     const locker = dbf._getCdxLocker(cdxPath);
     const range = indexLockRange(dbf);
     const alreadyHeld = locker.holdsRange(range);
-    if (!alreadyHeld) await locker.lock(range, 'read', {wait: true, timeoutMs: 10000});
+    if (!alreadyHeld) {
+        const wait = dbf._indexReadWaitTimeout > 0;
+        await locker.lock(range, 'read', wait ? {wait: true, timeoutMs: dbf._indexReadWaitTimeout} : undefined);
+    }
     try {
         return await action();
     }
