@@ -1,6 +1,6 @@
 {
   "name": "@trevster344/dbffile",
-  "version": "1.14.1",
+  "version": "1.15.0",
   "description": "Read and write .dbf (dBase III & Visual FoxPro) files in Node.js",
   "main": "dist/index.js",
   "typings": "dist/index.d.ts",
